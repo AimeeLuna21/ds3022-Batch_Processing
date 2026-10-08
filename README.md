@@ -159,3 +159,14 @@ You may observe and rerun your pipeline as often as you like, but in the end you
 - [Prefect documentation](https://docs.prefect.io/v3/get-started)
 - [dbt-duckdb adapter](https://github.com/duckdb/dbt-duckdb) and [dbt data tests](https://docs.getdbt.com/docs/build/data-tests)
 - [Moto server mode](https://docs.getmoto.org/en/latest/docs/server_mode.html), [ElasticMQ](https://github.com/softwaremill/elasticmq)
+
+
+Polling Strategy
+
+For this project, I used a polling strategy to monitor messages arriving in the SQS queue. The monitor_queue() task calls get_counts() every 5 seconds to check three message counters: visible, in-flight, and delayed.
+
+I chose a 5-second interval because the messages arrive at random times, and checking every 5 seconds allows me to track their progress without constantly requesting updates from SQS.
+
+The monitoring task stops when the delayed-message count reaches zero, meaning all scheduled messages have been released. I also included a 1,200-second (20-minute) timeout to prevent the task from running indefinitely if messages do not arrive.
+
+I considered checking the queue continuously without waiting, but rejected that approach because it would make unnecessary API requests. Polling every 5 seconds provides a reasonable balance between responsiveness and efficiency.

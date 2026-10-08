@@ -38,22 +38,89 @@ sqs = boto3.client("sqs")  # the endpoint comes from AWS_ENDPOINT_URL_SQS
 @task
 def populate_queue() -> str:
     """POST to the scatter API and return your queue URL."""
+    # Get Prefect's logger so we can track what happens during the task
     logger = get_run_logger()
-    # TODO (Checkpoint A)
-    raise NotImplementedError
+
+    # Send a POST request to the Scatter API to create our puzzle messages
+    # timeout=30 means stop waiting if the API does not respond within 30 seconds
+    resp = requests.post(SCATTER_URL, timeout=30)
+
+    # Check whether the API request was successful
+    # If it failed (e.g., HTTP 500), Python raises an error
+    resp.raise_for_status()
+
+    # Convert the API's JSON response into a Python dictionary
+    payload = resp.json()
+
+    # Print the API response in the Prefect logs
+    logger.info("Scatter API answered: %s", payload)
+
+    # Extract the SQS queue URL and return it to the Prefect flow
+    return payload["sqs_url"]
 
 
 def get_counts(queue_url: str) -> dict:
-    """Plain helper (not a task): return the three ApproximateNumberOf... counters as integers."""
-    # TODO (Checkpoint A)
-    raise NotImplementedError
 
+    """basically get 3 SQS message counters."""
+
+    #Ask SQS for the three queue attributes: ApproximateNumberOfMessages, ApproximateNumberOfMessagesNotVisible, ApproximateNumberOfMessagesDelayed
+    response = sqs.get_queue_attributes(
+        QueueUrl=queue_url,
+        AttributeNames=[
+            "ApproximateNumberOfMessages",
+            "ApproximateNumberOfMessagesNotVisible",
+            "ApproximateNumberOfMessagesDelayed",
+        ],
+    )
+
+    # Extract the attributes from the response
+    attributes = response["Attributes"]
+
+    # Convert the counts from strings to integers
+    return {
+        "visible": int(attributes["ApproximateNumberOfMessages"]),
+        "in_flight": int(attributes["ApproximateNumberOfMessagesNotVisible"]),
+        "delayed": int(attributes["ApproximateNumberOfMessagesDelayed"])
+    }
+    
 
 @task
 def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dict:
-    """Log the three counters every poll_s seconds until nothing is delayed; raise after timeout_s."""
-    # TODO (Checkpoint A)
-    raise NotImplementedError
+    """Monitor the SQS queue until all delayed messages are released."""
+
+    # Get Prefect's logger to record the queue counts
+    logger = get_run_logger()
+
+    # Calculate the time when monitoring must stop
+    # time.monotonic() tracks elapsed time
+    # timeout_s = 1200 seconds (20 minutes)
+    deadline = time.monotonic() + timeout_s
+
+    # Keep checking the queue until the deadline is reached
+    while time.monotonic() < deadline:
+
+        # Call our get_counts() helper to retrieve the three counters
+        c = get_counts(queue_url)
+
+        # Log the number of visible, in-flight, and delayed messages
+        logger.info(
+            "visible=%d  in_flight=%d  delayed=%d",
+            c["visible"],
+            c["in_flight"],
+            c["delayed"]
+        )
+
+        # If no messages remain delayed, stop monitoring
+        if c["delayed"] == 0:
+            logger.info("All messages released")
+            return c
+
+        # Wait 5 seconds (by default) before checking again
+        time.sleep(poll_s)
+
+    # If reach the deadline, stop the task with an error
+    raise TimeoutError(f"Messages still delayed after {timeout_s} s")
+
 
 
 @task
