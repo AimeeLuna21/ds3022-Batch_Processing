@@ -20,9 +20,11 @@ computing ID or the endpoint: read them from the environment (.env).
 """
 import os
 import time
+from venv import logger
 
 import boto3
 import duckdb
+from fastapi import logger
 import requests
 import subprocess
 from dotenv import load_dotenv
@@ -123,10 +125,16 @@ def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dic
     # If reach the deadline, stop the task with an error
     raise TimeoutError(f"Messages still delayed after {timeout_s} s")
 
+def stored_count(con) -> int:
+    """Count how many unique fragments are stored in DuckDB."""
+
+    return con.execute(
+        "SELECT COUNT(DISTINCT order_no) FROM raw.fragments"
+    ).fetchone()[0]
 
 @task
 def collect_messages(queue_url: str, expected: int = 21) -> int:
-    """Receive, store in DuckDB, then delete all expected SQS messages."""
+    """Collect all messages, store valid fragments, and empty the queue."""
 
     logger = get_run_logger()
 
@@ -134,7 +142,7 @@ def collect_messages(queue_url: str, expected: int = 21) -> int:
     con = duckdb.connect(DUCKDB_PATH)
 
     try:
-        # Create the raw schema and fragments table
+        # Create the table if it does not already exist
         con.execute("CREATE SCHEMA IF NOT EXISTS raw")
 
         con.execute("""
@@ -145,44 +153,49 @@ def collect_messages(queue_url: str, expected: int = 21) -> int:
             )
         """)
 
-        # Clear fragments from previous runs
+        # Clear data from previous pipeline runs
         con.execute("DELETE FROM raw.fragments")
+        con.commit()
 
-        # Keep track of how many messages we've stored
-        stored = 0
-
-        # Stop if messages never arrive
+        # Give the collection task 20 minutes to finish
         deadline = time.monotonic() + 1200
 
-        # Keep collecting until all 21 fragments are stored
-        while stored < expected:
+        # Continue until we have 21 unique fragments and an empty queue
+        while time.monotonic() < deadline:
 
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Only collected {stored} of {expected} fragments"
-                )
+            # Count unique fragments already stored in DuckDB
+            stored = stored_count(con)
 
-            # Request up to 10 messages from SQS
+            # Check the three SQS queue counters
+            counts = get_counts(queue_url)
+
+            logger.info(
+                "Stored %d/%d | visible=%d in_flight=%d delayed=%d",
+                stored,
+                expected,
+                counts["visible"],
+                counts["in_flight"],
+                counts["delayed"]
+            )
+
+            # Only finish when all fragments are stored
+            # AND there are no messages left in the queue
+            if stored >= expected and sum(counts.values()) == 0:
+                logger.info("All fragments collected and queue is empty")
+                return stored
+
+            # Receive up to 10 messages from SQS
             response = sqs.receive_message(
                 QueueUrl=queue_url,
                 MaxNumberOfMessages=10,
                 MessageAttributeNames=["All"],
-                WaitTimeSeconds=5
+                WaitTimeSeconds=10
             )
 
-            # SQS may return an empty response
-            messages = response.get("Messages", [])
+            # An empty response is normal when no messages are available
+            for message in response.get("Messages", []):
 
-            if not messages:
-                logger.info("No messages available yet; checking again")
-                continue
-
-            for message in messages:
-                 # Stop processing once we have all 21 fragments
-                if stored >= expected:
-                    break
-
-                # Extract attributes safely
+                # Get the message attributes safely
                 attributes = message.get("MessageAttributes", {})
 
                 order_no = attributes.get(
@@ -193,42 +206,49 @@ def collect_messages(queue_url: str, expected: int = 21) -> int:
                     "word", {}
                 ).get("StringValue")
 
-                # Save the message to DuckDB first
-                con.execute(
-                    """
-                    INSERT INTO raw.fragments (order_no, word)
-                    VALUES (?, ?)
-                    """,
-                    [order_no, word]
-                )
+                # If either attribute is missing, log the problem
+                if not order_no or not word:
+                    logger.warning(
+                        "Malformed message skipped: %s",
+                        attributes
+                    )
 
-                # Ensure the database write is committed
-                con.commit()
+                else:
+                    # Save valid fragments to DuckDB
+                    # Duplicates are allowed here; dbt removes them later
+                    con.execute(
+                        """
+                        INSERT INTO raw.fragments (order_no, word)
+                        VALUES (?, ?)
+                        """,
+                        [order_no, word]
+                    )
 
+                    # Save the data before deleting the SQS message
+                    con.commit()
 
-                # Delete only after DuckDB successfully stores it
+                    logger.info(
+                        "Stored fragment with order_no=%s",
+                        order_no
+                    )
+
+                # Delete both valid and malformed messages
+                # This prevents messages from remaining in SQS
                 sqs.delete_message(
                     QueueUrl=queue_url,
                     ReceiptHandle=message["ReceiptHandle"]
                 )
 
-                stored += 1
-
-                logger.info(
-                    "Stored and deleted fragment %d/%d: order_no=%s",
-                    stored,
-                    expected,
-                    order_no
-                )
-
-        logger.info("Successfully collected %d fragments", stored)
-
-        return stored
+        # If 20 minutes pass without completing, stop with an error
+        stored = stored_count(con)
+        raise TimeoutError(
+            f"Only collected {stored}/{expected} unique fragments "
+            "before the timeout"
+        )
 
     finally:
-        # Always close the database connection
+        # Always close the DuckDB connection
         con.close()
-
 
 @task
 def dbt_build() -> None:
@@ -296,9 +316,46 @@ def read_phrase() -> str:
 
 @task
 def submit_solution(phrase: str, platform: str = "prefect") -> int:
-    """Send to dp2-submit with uvaid / phrase / platform attributes. Return the HTTP status code."""
-    # TODO (Checkpoint D)
-    raise NotImplementedError
+    """Submit the reconstructed phrase to the dp2-submit queue."""
+
+    # Get the Prefect logger
+    logger = get_run_logger()
+
+    # Find the submission queue
+    queue_url = sqs.get_queue_url(QueueName="dp2-submit")["QueueUrl"]
+
+    # Send the completed phrase with the required message attributes
+    response = sqs.send_message(
+        QueueUrl=queue_url,
+        MessageBody="dp2 solution",
+        MessageAttributes={
+            "uvaid": {
+                "DataType": "String",
+                "StringValue": os.environ["UVA_ID"]
+            },
+            "phrase": {
+                "DataType": "String",
+                "StringValue": phrase
+            },
+            "platform": {
+                "DataType": "String",
+                "StringValue": platform
+            },
+        },
+    )
+
+    # Get the HTTP status code from the SQS response
+    status_code = response["ResponseMetadata"]["HTTPStatusCode"]
+
+    # Record the result in the Prefect logs
+    logger.info("Submission HTTP status: %s", status_code)
+
+    # Stop the pipeline if submission was unsuccessful
+    if status_code != 200:
+        raise RuntimeError(f"Submission failed with HTTP status {status_code}")
+
+    # Return the HTTP status code
+    return status_code
 
 
 @flow(name="dp2-pipeline", log_prints=True)
@@ -325,6 +382,13 @@ def dp2_pipeline():
 
     # Show the completed phrase in the Prefect logs
     print(f"Reconstructed phrase: {phrase}")
+
+    # Step 6: Submit the reconstructed phrase to the dp2-submit queue
+    # This only runs if all dbt quality tests passed
+    status_code = submit_solution(phrase)
+
+    # Log the submission result
+    print(f"Submission completed with HTTP status: {status_code}")
 
 
 
