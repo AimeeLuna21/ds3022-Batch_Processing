@@ -8,6 +8,7 @@ due: Monday 19 October 2026, 23:59 (after the Lesson 11 working session)
 total: 100 points
 weight: 20% of the course grade
 ---
+**GitHub Repository:** https://github.com/AimeeLuna21/ds3022-Batch_Processing
 
 # Data Project 2: Rubric
 
