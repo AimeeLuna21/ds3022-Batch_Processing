@@ -53,7 +53,7 @@ Not graded on its own. The first item is a recommended rehearsal for the require
 Details are given in class. Everything here counts towards the robustness part of the grade.
 
 - [ ✅] Full-delay evidence run (`DP2_FAST=0`) completed; dashboard screenshot and receipt code in README
-- [ ] Chaos mode (`DP2_CHAOS=1`): two consecutive runs end in PASS
+- [✅ ] Chaos mode (`DP2_CHAOS=1`): two consecutive runs end in PASS
 - [ ✅] Duplicate messages are counted once
 - [ ✅] Malformed messages are logged or stored **and deleted**; all queue counters are 0 at the end
 - [✅ ] README section "Chaos round": what broke, why, and how you fixed it
