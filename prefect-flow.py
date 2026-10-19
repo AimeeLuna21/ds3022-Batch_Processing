@@ -22,6 +22,7 @@ import os
 import time
 
 import boto3
+import duckdb
 import requests
 from dotenv import load_dotenv
 from prefect import flow, task, get_run_logger
@@ -122,12 +123,111 @@ def monitor_queue(queue_url: str, poll_s: int = 5, timeout_s: int = 1200) -> dic
     raise TimeoutError(f"Messages still delayed after {timeout_s} s")
 
 
-
 @task
 def collect_messages(queue_url: str, expected: int = 21) -> int:
-    """Receive, land in DuckDB, then delete. Return how many fragments are stored."""
-    # TODO (Checkpoint B): MessageAttributeNames=["All"] and resp.get("Messages", [])
-    raise NotImplementedError
+    """Receive, store in DuckDB, then delete all expected SQS messages."""
+
+    logger = get_run_logger()
+
+    # Connect to DuckDB
+    con = duckdb.connect(DUCKDB_PATH)
+
+    try:
+        # Create the raw schema and fragments table
+        con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS raw.fragments (
+                order_no VARCHAR,
+                word VARCHAR,
+                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Clear fragments from previous runs
+        con.execute("DELETE FROM raw.fragments")
+
+        # Keep track of how many messages we've stored
+        stored = 0
+
+        # Stop if messages never arrive
+        deadline = time.monotonic() + 1200
+
+        # Keep collecting until all 21 fragments are stored
+        while stored < expected:
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Only collected {stored} of {expected} fragments"
+                )
+
+            # Request up to 10 messages from SQS
+            response = sqs.receive_message(
+                QueueUrl=queue_url,
+                MaxNumberOfMessages=10,
+                MessageAttributeNames=["All"],
+                WaitTimeSeconds=5
+            )
+
+            # SQS may return an empty response
+            messages = response.get("Messages", [])
+
+            if not messages:
+                logger.info("No messages available yet; checking again")
+                continue
+
+            for message in messages:
+                 # Stop processing once we have all 21 fragments
+                if stored >= expected:
+                    break
+
+                # Extract attributes safely
+                attributes = message.get("MessageAttributes", {})
+
+                order_no = attributes.get(
+                    "order_no", {}
+                ).get("StringValue")
+
+                word = attributes.get(
+                    "word", {}
+                ).get("StringValue")
+
+                # Save the message to DuckDB first
+                con.execute(
+                    """
+                    INSERT INTO raw.fragments (order_no, word)
+                    VALUES (?, ?)
+                    """,
+                    [order_no, word]
+                )
+
+                # Ensure the database write is committed
+                con.commit()
+
+
+                # Delete only after DuckDB successfully stores it
+                sqs.delete_message(
+                    QueueUrl=queue_url,
+                    ReceiptHandle=message["ReceiptHandle"]
+                )
+
+                stored += 1
+
+                logger.info(
+                    "Stored and deleted fragment %d/%d: order_no=%s",
+                    stored,
+                    expected,
+                    order_no
+                )
+
+        logger.info("Successfully collected %d fragments", stored)
+
+        return stored
+
+    finally:
+        # Always close the database connection
+        con.close()
+
 
 
 @task
@@ -153,10 +253,20 @@ def submit_solution(phrase: str, platform: str = "prefect") -> int:
 
 @flow(name="dp2-pipeline", log_prints=True)
 def dp2_pipeline():
+
+    # Step 1: Generate the 21 SQS messages (once per run)
     queue_url = populate_queue()
+
+    # Step 2: Wait until all delayed messages are released
     monitor_queue(queue_url)
-    # TODO (Lesson 10): collect_messages -> dbt_build -> read_phrase -> submit_solution
 
+    # Step 3: Collect and store the 21 messages in DuckDB
+    stored = collect_messages(queue_url)
 
+    # Log how many fragments were collected
+    print(f"Total fragments stored: {stored}")
+
+    # Later: dbt_build, read_phrase, submit_solution
+    
 if __name__ == "__main__":
     dp2_pipeline()
