@@ -1,0 +1,16 @@
+version: 2
+
+models:
+  - name: stg_fragments
+    description: Cleaned SQS fragments with integer order numbers.
+    columns:
+      - name: order_no
+        description: Position of each word in the phrase.
+        data_tests:
+          - not_null
+          - unique
+
+      - name: word
+        description: Word belonging to each order number.
+        data_tests:
+          - not_null

@@ -24,6 +24,7 @@ import time
 import boto3
 import duckdb
 import requests
+import subprocess
 from dotenv import load_dotenv
 from prefect import flow, task, get_run_logger
 
@@ -229,19 +230,68 @@ def collect_messages(queue_url: str, expected: int = 21) -> int:
         con.close()
 
 
-
 @task
 def dbt_build() -> None:
-    """Run `dbt build --project-dir dbt --profiles-dir dbt`; raise if anything fails."""
-    # TODO (Checkpoint C)
-    raise NotImplementedError
+    """Build dbt models and run all quality tests."""
+
+    # Get the Prefect logger to record what happens during this task
+    logger = get_run_logger()
+
+    # Let us know that dbt is starting
+    logger.info("Starting dbt build and quality tests")
+
+    # Run dbt build to create the models and check all the tests
+    result = subprocess.run(
+        ["dbt", "build", "--project-dir", "dbt", "--profiles-dir", "dbt"],
+        capture_output=True,  # Save the command's output
+        text=True              # Return the output as readable text
+    )
+
+    # Show the dbt results in the Prefect logs
+    logger.info(result.stdout)
+
+    # If dbt fails, stop the pipeline so we don't submit incorrect data
+    if result.returncode != 0:
+        logger.error(result.stderr)
+        raise RuntimeError("dbt build failed: quality checks did not pass")
+
+    # Confirm that the models and tests completed successfully
+    logger.info("dbt build completed successfully")
+
 
 
 @task
 def read_phrase() -> str:
-    """Read the phrase from the dbt mart model in DuckDB."""
-    # TODO (Checkpoint C)
-    raise NotImplementedError
+    """Read the reconstructed phrase from DuckDB."""
+
+    # Get the Prefect logger
+    logger = get_run_logger()
+
+    # Connect to the DuckDB database
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+
+    try:
+        # Read the phrase created by our dbt assembled_phrase model
+        result = con.execute(
+            "SELECT phrase FROM main.assembled_phrase"
+        ).fetchone()
+
+        # Stop the pipeline if the phrase is missing or empty
+        if result is None or not result[0]:
+            raise ValueError("No assembled phrase found in DuckDB")
+
+        # Save the reconstructed phrase in a Python variable
+        phrase = result[0]
+
+        # Record the phrase in the Prefect logs
+        logger.info("Reconstructed phrase: %s", phrase)
+
+        # Return the phrase for the submission task
+        return phrase
+
+    finally:
+        # Always close the database connection
+        con.close()
 
 
 @task
@@ -266,7 +316,17 @@ def dp2_pipeline():
     # Log how many fragments were collected
     print(f"Total fragments stored: {stored}")
 
-    # Later: dbt_build, read_phrase, submit_solution
-    
+    # Step 4: Build the dbt models and run all quality tests
+    # If a test fails, the pipeline stops here
+    dbt_build()
+
+    # Step 5: Read the reconstructed phrase from DuckDB
+    phrase = read_phrase()
+
+    # Show the completed phrase in the Prefect logs
+    print(f"Reconstructed phrase: {phrase}")
+
+
+
 if __name__ == "__main__":
     dp2_pipeline()
